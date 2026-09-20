@@ -32,4 +32,5 @@ def solve_gap(req: GapRequest) -> GapResponse:
             {"start": seg.start, "end": seg.end, "source": seg.source}
             for seg in result.segments
         ],
+        certainty=list(result.certainty),
     )

@@ -20,15 +20,24 @@ computed with separate A/B prefix states; the no-source sentinel is only used
 for a first segment and is never inserted into an A/B state window.
 
 Both objectives use O(n) time and O(n) space.
+
+``certainty`` is objective-independent. It unions every plan attaining the
+global minimum cost, using separate source-agnostic minimum prefix and suffix
+DPs plus range-union bookkeeping. Tie-breakers used to select one reported
+plan never narrow that union.
 """
 
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 # Source ids double as tie-breakers: A < B.
 SOURCE_A = 0
 SOURCE_B = 1
 SOURCE_NAMES = ("A", "B")
+
+CERTAINTY_A_ONLY = "A_ONLY"
+CERTAINTY_B_ONLY = "B_ONLY"
+CERTAINTY_EITHER = "EITHER"
 
 OBJECTIVE_DEFAULT = "default"
 OBJECTIVE_CONTINUITY = "continuity"
@@ -52,6 +61,7 @@ class Segment:
 class Solution:
     cost: int
     segments: tuple[Segment, ...]
+    certainty: tuple[str, ...] = ()
 
 
 def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
@@ -63,8 +73,16 @@ def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
     layer; the algorithm itself trusts the bounds.
     """
     if objective == OBJECTIVE_CONTINUITY:
-        return _solve_continuity(n, costs, fee_a, fee_b, max_len)
-    return _solve_default(n, costs, fee_a, fee_b, max_len)
+        solution = _solve_continuity(n, costs, fee_a, fee_b, max_len)
+    else:
+        solution = _solve_default(n, costs, fee_a, fee_b, max_len)
+
+    certainty = _certainty(n, costs, fee_a, fee_b, max_len, solution.cost)
+    return Solution(
+        cost=solution.cost,
+        segments=solution.segments,
+        certainty=tuple(certainty),
+    )
 
 
 def _prefix_sums(
@@ -77,6 +95,141 @@ def _prefix_sums(
         prefix_a[k + 1] = prefix_a[k] + a
         prefix_b[k + 1] = prefix_b[k] + b
     return prefix_a, prefix_b
+
+
+def _minimum_prefix_costs(
+    n: int, prefixes: tuple[list[int], list[int]],
+    fee_a: int, fee_b: int, max_len: int
+) -> list[int]:
+    """Minimum cost of covering each prefix, ignoring all tie-breakers."""
+    fees = (fee_a, fee_b)
+    best_cost = [0] * (n + 1)
+    windows: tuple[deque, deque] = (deque([0]), deque([0]))
+
+    for j in range(1, n + 1):
+        low = j - max_len
+        candidates = []
+        for s, window in enumerate(windows):
+            while window and window[0] < low:
+                window.popleft()
+            i = window[0]
+            candidates.append(
+                best_cost[i] - prefixes[s][i]
+                + prefixes[s][j] + fees[s]
+            )
+        best_cost[j] = min(candidates)
+
+        for s, window in enumerate(windows):
+            key = best_cost[j] - prefixes[s][j]
+            while window:
+                tail = window[-1]
+                if best_cost[tail] - prefixes[s][tail] < key:
+                    break
+                window.pop()
+            window.append(j)
+
+    return best_cost
+
+
+def _minimum_suffix_costs(
+    n: int, prefixes: tuple[list[int], list[int]],
+    fee_a: int, fee_b: int, max_len: int
+) -> list[int]:
+    """Minimum cost of covering [j, n), ignoring all tie-breakers."""
+    fees = (fee_a, fee_b)
+    suffix_cost = [0] * (n + 1)
+    windows: tuple[deque, deque] = (deque([n]), deque([n]))
+
+    for j in range(n - 1, -1, -1):
+        high = j + max_len
+        candidates = []
+        for s, window in enumerate(windows):
+            while window and window[0] > high:
+                window.popleft()
+            k = window[0]
+            candidates.append(
+                suffix_cost[k] + fees[s]
+                + prefixes[s][k] - prefixes[s][j]
+            )
+        suffix_cost[j] = min(candidates)
+
+        for s, window in enumerate(windows):
+            key = suffix_cost[j] + prefixes[s][j]
+            while window:
+                tail = window[-1]
+                if suffix_cost[tail] + prefixes[s][tail] < key:
+                    break
+                window.pop()
+            window.append(j)
+
+    return suffix_cost
+
+
+def _certainty(n: int, costs: list[tuple[int, int]], fee_a: int,
+               fee_b: int, max_len: int, minimum: int) -> list[str]:
+    """Union all optimal segments covering each position.
+
+    A source-s segment [i, j) belongs to a globally minimum plan exactly when
+    ``min_prefix[i] + segment_cost + min_suffix[j] == minimum``. Prefix values
+    are grouped by the recurrence key, so all qualifying starts are found
+    without enumerating i for each j.
+    """
+    fees = (fee_a, fee_b)
+    prefixes = _prefix_sums(n, costs)
+    prefix_cost = _minimum_prefix_costs(
+        n, prefixes, fee_a, fee_b, max_len)
+    suffix_cost = _minimum_suffix_costs(
+        n, prefixes, fee_a, fee_b, max_len)
+
+    coverage_diff = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    # For each source, buckets map recurrence key to feasible prefix starts in
+    # increasing order. This is a hash-window companion to the min-cost DPs.
+    windows: tuple[dict[int, deque], dict[int, deque]] = (
+        defaultdict(deque),
+        defaultdict(deque),
+    )
+    for s in (SOURCE_A, SOURCE_B):
+        windows[s][prefix_cost[0] - prefixes[s][0]].append(0)
+
+    for j in range(1, n + 1):
+        low = j - max_len
+        for s in (SOURCE_A, SOURCE_B):
+            target = (
+                minimum - prefixes[s][j] - fees[s] - suffix_cost[j]
+            )
+            starts = windows[s].get(target)
+            if starts is not None:
+                while starts and starts[0] < low:
+                    starts.popleft()
+                if starts:
+                    # For fixed (s, j), all qualifying starts cover [i, j);
+                    # their union is one interval from the smallest start to j.
+                    start = starts[0]
+                    coverage_diff[s][start] += 1
+                    coverage_diff[s][j] -= 1
+
+        for s in (SOURCE_A, SOURCE_B):
+            key = prefix_cost[j] - prefixes[s][j]
+            windows[s][key].append(j)
+
+    covered = [[False] * n for _ in (SOURCE_A, SOURCE_B)]
+    for s in (SOURCE_A, SOURCE_B):
+        active = 0
+        for k in range(n):
+            active += coverage_diff[s][k]
+            covered[s][k] = active > 0
+
+    labels = []
+    for k in range(n):
+        a_possible = covered[SOURCE_A][k]
+        b_possible = covered[SOURCE_B][k]
+        if a_possible and b_possible:
+            labels.append(CERTAINTY_EITHER)
+        elif a_possible:
+            labels.append(CERTAINTY_A_ONLY)
+        else:
+            labels.append(CERTAINTY_B_ONLY)
+    return labels
 
 
 def _solve_default(n: int, costs: list[tuple[int, int]], fee_a: int,

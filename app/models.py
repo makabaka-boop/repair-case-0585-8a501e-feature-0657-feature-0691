@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, StrictInt, model_validator
 
 SourceName = Literal["A", "B"]
+CertaintyName = Literal["A_ONLY", "B_ONLY", "EITHER"]
 ObjectiveName = Literal["default", "continuity"]
 
 
@@ -42,3 +43,4 @@ class SegmentOut(BaseModel):
 class GapResponse(BaseModel):
     cost: int
     segments: list[SegmentOut]
+    certainty: list[CertaintyName]

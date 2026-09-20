@@ -129,6 +129,69 @@ def continuity_plan_key(plan, pref, fees):
     )
 
 
+def certainty_oracle(n, costs, fee_a, fee_b, max_len):
+    """Enumerate all optimal plans and union the source at each position."""
+    fees = (fee_a, fee_b)
+    pref = [[0] * (n + 1) for _ in range(2)]
+    for k in range(n):
+        pref[0][k + 1] = pref[0][k] + costs[k][0]
+        pref[1][k + 1] = pref[1][k] + costs[k][1]
+
+    plans = list(enumerate_plans(n, max_len))
+    minimum = min(plan_cost(plan, pref, fees) for plan in plans)
+    possible = [[False, False] for _ in range(n)]
+    for plan in plans:
+        if plan_cost(plan, pref, fees) != minimum:
+            continue
+        for start, end, source in plan:
+            for position in range(start, end):
+                possible[position][source] = True
+
+    return [
+        "EITHER" if a and b else "A_ONLY" if a else "B_ONLY"
+        for a, b in possible
+    ]
+
+
+def certainty_direct_oracle(n, costs, fee_a, fee_b, max_len):
+    """O(nL) prefix/suffix oracle for source possibility at each position."""
+    fees = (fee_a, fee_b)
+    pref = [[0] * (n + 1) for _ in range(2)]
+    for k in range(n):
+        pref[0][k + 1] = pref[0][k] + costs[k][0]
+        pref[1][k + 1] = pref[1][k] + costs[k][1]
+
+    prefix = [10**30] * (n + 1)
+    suffix = [10**30] * (n + 1)
+    prefix[0] = suffix[n] = 0
+    for j in range(1, n + 1):
+        prefix[j] = min(
+            prefix[i] + fees[s] + pref[s][j] - pref[s][i]
+            for i in range(max(0, j - max_len), j)
+            for s in range(2)
+        )
+    for i in range(n - 1, -1, -1):
+        suffix[i] = min(
+            suffix[j] + fees[s] + pref[s][j] - pref[s][i]
+            for j in range(i + 1, min(n, i + max_len) + 1)
+            for s in range(2)
+        )
+
+    possible = [[False, False] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, min(n, i + max_len) + 1):
+            for s in range(2):
+                complete = prefix[i] + suffix[j]
+                complete += fees[s] + pref[s][j] - pref[s][i]
+                if complete == prefix[n]:
+                    for position in range(i, j):
+                        possible[position][s] = True
+    return [
+        "EITHER" if a and b else "A_ONLY" if a else "B_ONLY"
+        for a, b in possible
+    ]
+
+
 def enumerated_oracle(n, costs, fee_a, fee_b, max_len, objective):
     """Choose directly from the complete set of feasible plans."""
     fees = (fee_a, fee_b)
@@ -407,6 +470,12 @@ def test_matches_exhaustive_oracle_all_fees(n, objective):
             n, costs, fa, fb, L, objective)
         assert sol.cost == ocost
         assert [(s.start, s.end, s.source) for s in sol.segments] == osegs
+        assert list(sol.certainty) == certainty_oracle(
+            n, costs, fa, fb, L)
+        assert list(solve(
+            n, costs, fa, fb, L,
+            objective="continuity" if objective == "default" else "default"
+        ).certainty) == list(sol.certainty)
         assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
 
 
@@ -443,6 +512,20 @@ def test_objective_lock_case():
     assert default_sol.cost == continuity_sol.cost == 0
 
 
+def test_certainty_lock_case_and_objective_independence():
+    n, L = 3, 2
+    costs = [(0, 5), (0, 0), (5, 0)]
+    expected = ["A_ONLY", "EITHER", "B_ONLY"]
+    default_sol = solve(n, costs, 0, 0, L)
+    continuity_sol = solve(
+        n, costs, 0, 0, L, objective="continuity")
+    assert default_sol.cost == continuity_sol.cost == 0
+    assert list(default_sol.certainty) == expected
+    assert list(continuity_sol.certainty) == expected
+    assert list(default_sol.certainty) == certainty_oracle(
+        n, costs, 0, 0, L)
+
+
 # --------------------------------------------------------------------------
 # Larger / max-scale cases
 # --------------------------------------------------------------------------
@@ -458,6 +541,11 @@ def test_random_medium_against_oracle():
         ocost, osegs = oracle(n, costs, fa, fb, L)
         assert sol.cost == ocost
         assert [(s.start, s.end, s.source) for s in sol.segments] == osegs
+        assert list(sol.certainty) == certainty_direct_oracle(
+            n, costs, fa, fb, L)
+        assert list(solve(
+            n, costs, fa, fb, L, objective="continuity").certainty
+        ) == list(sol.certainty)
 
 
 def test_random_medium_continuity_against_reference():
@@ -470,6 +558,10 @@ def test_random_medium_continuity_against_reference():
         rc_cost, rc_segs = continuity_reference(n, costs, fa, fb, L)
         assert sol.cost == rc_cost
         assert [(s.start, s.end, s.source) for s in sol.segments] == rc_segs
+        assert list(sol.certainty) == certainty_direct_oracle(
+            n, costs, fa, fb, L)
+        assert list(solve(n, costs, fa, fb, L).certainty) == list(
+            sol.certainty)
 
 
 def test_max_scale_full():
@@ -487,6 +579,11 @@ def test_max_scale_full():
     ref_cost, ref_segs = heap_reference(n, costs, fa, fb, L)
     assert sol.cost == ref_cost
     assert [(s.start, s.end, s.source) for s in sol.segments] == ref_segs
+    assert len(sol.certainty) == n
+    assert set(sol.certainty) <= {"A_ONLY", "B_ONLY", "EITHER"}
+    assert list(solve(
+        n, costs, fa, fb, L, objective="continuity").certainty
+    ) == list(sol.certainty)
     assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
 
 
@@ -554,9 +651,12 @@ def test_api_happy_path_and_replay():
     resp = client.post("/solve", json=_payload())
     assert resp.status_code == 200
     data = resp.json()
-    assert set(data) == {"cost", "segments"}
+    assert set(data) == {"cost", "segments", "certainty"}
     n = 5
     costs = [(k, k + 1) for k in range(n)]
+    assert len(data["certainty"]) == n
+    assert set(data["certainty"]) <= {"A_ONLY", "B_ONLY", "EITHER"}
+    assert data["certainty"] == certainty_oracle(n, costs, 1, 2, 3)
     assert_plan_valid(
         [Segment(s["start"], s["end"], s["source"]) for s in data["segments"]],
         n, 3, costs, (1, 2), data["cost"])
@@ -571,6 +671,7 @@ def test_api_default_objective_compatibility():
     explicit = client.post("/solve", json=_payload(objective="default"))
     assert omitted.status_code == explicit.status_code == 200
     assert omitted.json() == explicit.json()
+    assert set(omitted.json()) == {"cost", "segments", "certainty"}
 
 
 def test_api_continuity_objective():
@@ -595,7 +696,17 @@ def test_api_continuity_objective():
         {"start": 1, "end": 2, "source": "B"},
         {"start": 2, "end": 3, "source": "A"},
     ]
-    assert set(continuity_resp.json()) == {"cost", "segments"}
+    assert set(continuity_resp.json()) == {
+        "cost", "segments", "certainty"}
+    expected_certainty = certainty_oracle(
+        3,
+        [(0, 0), (1, 0), (0, 1)],
+        0,
+        0,
+        1,
+    )
+    assert continuity_resp.json()["certainty"] == expected_certainty
+    assert default_resp.json()["certainty"] == expected_certainty
 
 
 def test_api_max_scale():
@@ -609,6 +720,8 @@ def test_api_max_scale():
     assert resp.status_code == 200
     data = resp.json()
     segs = data["segments"]
+    assert len(data["certainty"]) == n
+    assert set(data["certainty"]) <= {"A_ONLY", "B_ONLY", "EITHER"}
     assert segs[0]["start"] == 0 and segs[-1]["end"] == n
     assert all(b["start"] == a["end"] for a, b in zip(segs, segs[1:]))
     assert all(1 <= s["end"] - s["start"] <= 4096 for s in segs)
@@ -650,6 +763,7 @@ def test_api_validation_errors_422(payload):
     # Only the standard validation payload; never a partial plan.
     assert set(body) == {"detail"}
     assert "cost" not in body and "segments" not in body
+    assert "certainty" not in body
 
 
 def test_health():
