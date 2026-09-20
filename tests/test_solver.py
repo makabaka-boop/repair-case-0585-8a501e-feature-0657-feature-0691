@@ -151,6 +151,41 @@ def enumerated_oracle(n, costs, fee_a, fee_b, max_len, objective):
     )
 
 
+def certainty_oracle(n, costs, fee_a, fee_b, max_len):
+    """Independent oracle for per-position source unions.
+
+    Enumerates *every* legal segmentation and A/B source assignment, keeps
+    those whose total cost equals the global minimum, and unions the sources
+    covering each position. Tie-breaking (segment count, switches, ...) is
+    deliberately ignored: every minimum-cost plan contributes.
+    """
+    fees = (fee_a, fee_b)
+    pref = [[0] * (n + 1) for _ in range(2)]
+    for k in range(n):
+        pref[0][k + 1] = pref[0][k] + costs[k][0]
+        pref[1][k + 1] = pref[1][k] + costs[k][1]
+
+    optimum = min(plan_cost(plan, pref, fees)
+                  for plan in enumerate_plans(n, max_len))
+    possible = [[False, False] for _ in range(n)]
+    for plan in enumerate_plans(n, max_len):
+        if plan_cost(plan, pref, fees) != optimum:
+            continue
+        for start, end, source in plan:
+            for k in range(start, end):
+                possible[k][source] = True
+
+    labels = []
+    for a_possible, b_possible in possible:
+        if a_possible and b_possible:
+            labels.append("EITHER")
+        elif a_possible:
+            labels.append("A_ONLY")
+        else:
+            labels.append("B_ONLY")
+    return labels
+
+
 def continuity_reference(n, costs, fee_a, fee_b, max_len):
     """Independent O(nL) DP using the full recursive continuity ordering."""
     fees = (fee_a, fee_b)
@@ -408,6 +443,46 @@ def test_matches_exhaustive_oracle_all_fees(n, objective):
         assert sol.cost == ocost
         assert [(s.start, s.end, s.source) for s in sol.segments] == osegs
         assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
+        # Certainty is the union over ALL minimum-cost plans and is
+        # independent of the objective's secondary adjudication.
+        expected_certainty = certainty_oracle(n, costs, fa, fb, L)
+        assert list(sol.certainty) == expected_certainty
+        other = solve(n, costs, fa, fb, L,
+                      objective="continuity" if objective == "default"
+                      else "default")
+        assert list(other.certainty) == expected_certainty
+
+
+@pytest.mark.parametrize("objective", ["default", "continuity"])
+def test_certainty_exhaustive_zero_costs(objective):
+    # All-zero per-position costs with a variety of L: every cover costs the
+    # same, so every position must be EITHER whenever a same-position source
+    # choice exists. The independent enumerator is the authority.
+    for n in range(1, 8):
+        for L in range(1, n + 1):
+            for fa, fb in ((0, 0), (0, 1), (2, 2)):
+                costs = [(0, 0)] * n
+                sol = solve(n, costs, fa, fb, L, objective=objective)
+                assert list(sol.certainty) == \
+                    certainty_oracle(n, costs, fa, fb, L)
+
+
+def test_certainty_locked_case():
+    # n=3, L=2, all fees zero, costs=[(0,5),(0,0),(5,0)]:
+    # minimum cost 0. Position 0 can only be A (B there already costs 5);
+    # position 2 only B; position 1 is served by either source across the
+    # set of optimal covers.
+    n, L = 3, 2
+    costs = [(0, 5), (0, 0), (5, 0)]
+    expected = ["A_ONLY", "EITHER", "B_ONLY"]
+    default_sol = solve(n, costs, 0, 0, L)
+    continuity_sol = solve(n, costs, 0, 0, L, objective="continuity")
+    assert list(default_sol.certainty) == expected
+    assert list(continuity_sol.certainty) == expected
+    assert default_sol.cost == continuity_sol.cost == 0
+    # Old fields still obey their own objective rules.
+    assert [(s.start, s.end, s.source)
+            for s in default_sol.segments] == [(0, 1, "A"), (1, 3, "B")]
 
 
 def test_handcrafted_tie_breakers():
@@ -508,6 +583,98 @@ def test_max_scale_continuity():
     assert_plan_valid(sol.segments, n, L, costs, (fa, fb), sol.cost)
 
 
+def test_max_scale_certainty_performance_and_consistency():
+    # n=200000, L=4096: certainty must stay O(n) and both objectives report
+    # identical labels. With random costs/fees ties are effectively absent,
+    # so each position is forced to a single source; the reported winner's
+    # segments must be consistent with the labels.
+    n, L = 200_000, 4096
+    rng = random.Random(700)
+    costs = [(rng.randrange(0, 1_000_001), rng.randrange(0, 1_000_001))
+             for _ in range(n)]
+    fa, fb = rng.randrange(0, 1_000_001), rng.randrange(0, 1_000_001)
+
+    t0 = time.perf_counter()
+    sol = solve(n, costs, fa, fb, L)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 10.0
+    assert len(sol.certainty) == n
+    assert set(sol.certainty) <= {"A_ONLY", "B_ONLY", "EITHER"}
+
+    cont = solve(n, costs, fa, fb, L, objective="continuity")
+    assert list(cont.certainty) == list(sol.certainty)
+
+    # Every segment of the (unique) optimum agrees with its labels, and no
+    # A_ONLY position is served by B or vice versa.
+    label_at = sol.certainty
+    for seg in sol.segments:
+        for k in range(seg.start, seg.end):
+            assert label_at[k] in (
+                "EITHER", seg.source + "_ONLY")
+
+    # Structural check against the cost-only prefix/suffix split: the label
+    # set is recomputed directly from a naive O(nL) DP at small L below.
+
+
+def test_certainty_matches_naive_prefix_suffix_split():
+    # Independent O(nL) recomputation of the prefix/suffix optimality test,
+    # rather than replaying the solver's own windows.
+    def naive_certainty(n, costs, fa, fb, max_len):
+        pref = [[0] * (n + 1) for _ in range(2)]
+        for k in range(n):
+            pref[0][k + 1] = pref[0][k] + costs[k][0]
+            pref[1][k + 1] = pref[1][k] + costs[k][1]
+        fees = (fa, fb)
+        inf = float("inf")
+        f = [inf] * (n + 1)
+        f[0] = 0
+        for j in range(1, n + 1):
+            for i in range(max(0, j - max_len), j):
+                for s in (SOURCE_A, SOURCE_B):
+                    v = f[i] + fees[s] + pref[s][j] - pref[s][i]
+                    if v < f[j]:
+                        f[j] = v
+        g = [inf] * (n + 1)
+        g[n] = 0
+        for i in range(n - 1, -1, -1):
+            for j in range(i + 1, min(n, i + max_len) + 1):
+                for s in (SOURCE_A, SOURCE_B):
+                    v = fees[s] + pref[s][j] - pref[s][i] + g[j]
+                    if v < g[i]:
+                        g[i] = v
+        optimum = f[n]
+        poss = [[False, False] for _ in range(n)]
+        for j in range(1, n + 1):
+            for i in range(max(0, j - max_len), j):
+                for s in (SOURCE_A, SOURCE_B):
+                    if f[i] + fees[s] + pref[s][j] - pref[s][i] + g[j] \
+                            == optimum:
+                        for k in range(i, j):
+                            poss[k][s] = True
+        return ["EITHER" if a and b else "A_ONLY" if a else "B_ONLY"
+                for a, b in poss]
+
+    rng = random.Random(31337)
+    # Small-L max-scale case keeps the O(nL) oracle feasible.
+    n, L = 200_000, 3
+    costs = [(rng.randrange(0, 1_000_001), rng.randrange(0, 1_000_001))
+             for _ in range(n)]
+    fa, fb = 500_000, 500_000
+    sol = solve(n, costs, fa, fb, L)
+    assert list(sol.certainty) == naive_certainty(n, costs, fa, fb, L)
+
+    # Plus a handful of smaller randomized cross-checks.
+    rng = random.Random(31338)
+    for _ in range(25):
+        m = rng.randrange(1, 40)
+        m_l = rng.randrange(1, min(m, 8) + 1)
+        c = [(rng.randrange(0, 12), rng.randrange(0, 12)) for _ in range(m)]
+        a_fee, b_fee = rng.randrange(0, 6), rng.randrange(0, 6)
+        got = solve(m, c, a_fee, b_fee, m_l)
+        assert list(got.certainty) == \
+            naive_certainty(m, c, a_fee, b_fee, m_l)
+
+
 def test_larger_than_n_window():
     # L may exceed n; the window simply covers every predecessor.
     rng = random.Random(2026)
@@ -554,7 +721,7 @@ def test_api_happy_path_and_replay():
     resp = client.post("/solve", json=_payload())
     assert resp.status_code == 200
     data = resp.json()
-    assert set(data) == {"cost", "segments"}
+    assert set(data) == {"cost", "segments", "certainty"}
     n = 5
     costs = [(k, k + 1) for k in range(n)]
     assert_plan_valid(
@@ -564,6 +731,9 @@ def test_api_happy_path_and_replay():
     assert data["cost"] == ocost
     assert [(s["start"], s["end"], s["source"]) for s in
             data["segments"]] == osegs
+    assert data["certainty"] == certainty_oracle(n, costs, 1, 2, 3)
+    assert len(data["certainty"]) == n
+    assert set(data["certainty"]) <= {"A_ONLY", "B_ONLY", "EITHER"}
 
 
 def test_api_default_objective_compatibility():
@@ -571,6 +741,28 @@ def test_api_default_objective_compatibility():
     explicit = client.post("/solve", json=_payload(objective="default"))
     assert omitted.status_code == explicit.status_code == 200
     assert omitted.json() == explicit.json()
+
+
+def test_api_certainty_objective_independent():
+    # certainty describes the full set of minimum-cost covers, so it must be
+    # byte-for-byte identical across objectives even when segments differ.
+    payload = _payload(
+        n=3,
+        L=1,
+        fee_a=0,
+        fee_b=0,
+        costs=[{"a": 0, "b": 0}, {"a": 1, "b": 0}, {"a": 0, "b": 1}],
+    )
+    default_resp = client.post("/solve", json=payload)
+    continuity_resp = client.post(
+        "/solve", json={**payload, "objective": "continuity"})
+    assert default_resp.json()["certainty"] == \
+        continuity_resp.json()["certainty"]
+    assert default_resp.json()["cost"] == continuity_resp.json()["cost"]
+    # Secondary adjudication may change the reported segments but never the
+    # set of possible per-position sources.
+    assert default_resp.json()["segments"] != \
+        continuity_resp.json()["segments"]
 
 
 def test_api_continuity_objective():
@@ -595,7 +787,9 @@ def test_api_continuity_objective():
         {"start": 1, "end": 2, "source": "B"},
         {"start": 2, "end": 3, "source": "A"},
     ]
-    assert set(continuity_resp.json()) == {"cost", "segments"}
+    assert set(continuity_resp.json()) == {"cost", "segments", "certainty"}
+    assert continuity_resp.json()["certainty"] == \
+        default_resp.json()["certainty"]
 
 
 def test_api_max_scale():
@@ -612,6 +806,13 @@ def test_api_max_scale():
     assert segs[0]["start"] == 0 and segs[-1]["end"] == n
     assert all(b["start"] == a["end"] for a, b in zip(segs, segs[1:]))
     assert all(1 <= s["end"] - s["start"] <= 4096 for s in segs)
+    assert len(data["certainty"]) == n
+    assert set(data["certainty"]) <= {"A_ONLY", "B_ONLY", "EITHER"}
+    # Labels agree with the reported (unique-optimum) segmentation.
+    for seg in segs:
+        for k in range(seg["start"], seg["end"]):
+            assert data["certainty"][k] in (
+                "EITHER", seg["source"] + "_ONLY")
 
 
 @pytest.mark.parametrize("payload", [
@@ -650,6 +851,7 @@ def test_api_validation_errors_422(payload):
     # Only the standard validation payload; never a partial plan.
     assert set(body) == {"detail"}
     assert "cost" not in body and "segments" not in body
+    assert "certainty" not in body
 
 
 def test_health():

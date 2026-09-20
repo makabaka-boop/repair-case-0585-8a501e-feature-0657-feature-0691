@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, StrictInt, model_validator
 
 SourceName = Literal["A", "B"]
 ObjectiveName = Literal["default", "continuity"]
+CertaintyName = Literal["A_ONLY", "B_ONLY", "EITHER"]
 
 
 class PositionCost(BaseModel):
@@ -42,3 +43,7 @@ class SegmentOut(BaseModel):
 class GapResponse(BaseModel):
     cost: int
     segments: list[SegmentOut]
+    # Per position 0..n-1: A_ONLY / B_ONLY mean every minimum-cost cover
+    # uses that source there; EITHER means both sources occur in at least one
+    # minimum-cost cover. Objective-independent.
+    certainty: list[CertaintyName]
